@@ -1,3 +1,4 @@
 # Photon
 
-A description of this package.
+> **Warning**
+> Currently, Photon assumes that your JSON array is just a simple data and does not have complex structure (e.g., nested objects, arrays, etc).
