@@ -10,42 +10,52 @@ import IkigaJSON
 import Dispatch
 import ObjectiveC
 
-public class Photon<Value: Hashable & Codable> : NSObject, URLSessionDataDelegate {
-    
-    private var session: URLSession! = nil
-    private var decoder = IkigaJSONDecoder()
-    private var previous: [URL: Data] = [:]
-    private let semaphore = DispatchSemaphore(value: 1)
+public enum DataSource {
+    case server(URL)
+    case local(URL)
+}
 
-    public override init() {
-        super.init()
-        let config = URLSessionConfiguration.default
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue())
+public final class Photon : NSObject, URLSessionDataDelegate {
+    public class func stream<Value: Hashable & Codable>(source: DataSource, streamBlock: @escaping (Set<Value>) -> Void, completionBlock: @escaping () -> Void) {
+        switch source {
+        case .server(let url):
+            let manager = ServerSessionManager<Value>()
+            manager.stream(url: url) {
+                streamBlock($0)
+            } completion: {
+                completionBlock()
+            }
+        case .local(let _):
+            // TODO: Support for local file streaming
+            break
+        }
+    }
+}
+
+final class ServerSessionManager<Value: Hashable & Codable> : NSObject {
+    
+    private struct SessionCallback {
+        let receive: (URLSession, URLSessionDataTask, Data) -> Void
+        let complete: (URLSession, URLSessionTask, Error?) -> Void
     }
     
-    private var tasks: [URL: URLSessionDataTask] = [:]
-    private var streamBlocks: [URL: (Set<Value>) -> Void] = [:]
-    private var completionBlocks: [URL: () -> Void] = [:]
-
-    public func stream(for url: URL, streamBlock: @escaping (Set<Value>) -> Void, completionBlock: @escaping () -> Void) {
-        guard !self.streamBlocks.contains(where: { $0.key == url }) else { return }
+    private class SessionDataDelegate : NSObject, URLSessionDataDelegate {
+        private var callback: SessionCallback
         
-        self.streamBlocks[url] = streamBlock
-        self.completionBlocks[url] = completionBlock
-
-        let request = URLRequest(url: url)
-        let task = self.session.dataTask(with: request)
-        self.tasks[url] = task
-        task.resume()
+        init(callback: SessionCallback) {
+            self.callback = callback
+        }
+        
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            self.callback.receive(session, dataTask, data)
+        }
+        
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            self.callback.complete(session, task, error)
+        }
     }
-
-    public func stop() {
-        self.tasks.forEach { $0.value.cancel() }
-        self.semaphore.wait()
-        self.previous = [:]
-        self.semaphore.signal()
-    }
+    
+    let decoder = IkigaJSONDecoder()
     
     private func decodeThenInsert(data: Data, to set: inout Set<Value>) {
         do {
@@ -55,91 +65,89 @@ public class Photon<Value: Hashable & Codable> : NSObject, URLSessionDataDelegat
             debugPrint(error.localizedDescription)
         }
     }
-
-    public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard let request = dataTask.currentRequest, let url = request.url else { return }
+    
+    func stream(url: URL, received: @escaping (Set<Value>) -> Void, completion: @escaping () -> Void) {
+        let semaphore = DispatchSemaphore(value: 1)
         
-        self.semaphore.wait()
+        let config = URLSessionConfiguration.default
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
         
-        var lowerBound: Int = -1
-        var upperBound: Int = -1
-        var inside: Bool = true
+        var previous: Data? = nil
         
-        var set = Set<Value>()
-        
-        for index in 0 ..< data.count {
-            let byte = data[index]
+        let callback = SessionCallback { session, dataTask, data in
+            semaphore.wait()
             
-            switch byte {
-            case 123: /// ASCII value for `{`
-                lowerBound = index
+            var lowerBound: Int = -1
+            var upperBound: Int = -1
+            var inside: Bool = true
+            
+            var set = Set<Value>()
+            
+            for index in 0 ..< data.count {
+                let byte = data[index]
                 
-            case 125: /// ASCII value for `}`
-                if let previous_data = self.previous[url], lowerBound < 0 && upperBound < 0 { /// This means that this `}` is the first brace detected, so we find the `{` in the cached buffer.
-                    var buffer_index = previous_data.count - 1
+                switch byte {
+                case 123: /// ASCII value for `{`
+                    lowerBound = index
                     
-                    while buffer_index >= 0 {
-                        let byte = previous_data[buffer_index]
+                case 125: /// ASCII value for `}`
+                    if let previous_data = previous, lowerBound < 0 && upperBound < 0 { /// This means that this `}` is the first brace detected, so we find the `{` in the cached buffer.
+                        var buffer_index = previous_data.count - 1
                         
-                        if 123 == byte { /// ASCII value for `{`
-                            lowerBound = buffer_index
-                            inside = false
-                            break
+                        while buffer_index >= 0 {
+                            let byte = previous_data[buffer_index]
+                            
+                            if 123 == byte { /// ASCII value for `{`
+                                lowerBound = buffer_index
+                                inside = false
+                                break
+                            }
+                            buffer_index -= 1
                         }
-                        buffer_index -= 1
                     }
+                    
+                    upperBound = index
+                    
+                default: break
                 }
                 
-                upperBound = index
-                
-            default: break
+                if lowerBound != -1 && upperBound != -1 {
+                    if inside {
+                        if lowerBound < upperBound {
+                            let data = data[lowerBound...upperBound]
+                            self.decodeThenInsert(data: data, to: &set)
+                        }
+                    } else if let previous_data = previous {
+                        let buffer_count = previous_data.count
+                        if lowerBound < buffer_count {
+                            let data = previous_data[lowerBound..<buffer_count] + data[0...upperBound]
+                            self.decodeThenInsert(data: data, to: &set)
+                        }
+                    }
+                    
+                    lowerBound = -1
+                    upperBound = -1
+                    inside = true
+                }
             }
             
-            if lowerBound != -1 && upperBound != -1 {
-                if inside {
-                    if lowerBound < upperBound {
-                        let data = data[lowerBound...upperBound]
-                        self.decodeThenInsert(data: data, to: &set)
-                    }
-                } else if let previous_data = self.previous[url] {
-                    let buffer_count = previous_data.count
-                    if lowerBound < buffer_count {
-                        let data = previous_data[lowerBound..<buffer_count] + data[0...upperBound]
-                        self.decodeThenInsert(data: data, to: &set)
-                    }
-                }
-                
-                lowerBound = -1
-                upperBound = -1
-                inside = true
-            }
+            received(set)
+            
+            previous = data
+            
+            semaphore.signal()
+        } complete: { session, task, error in
+            completion()
+            previous = Data()
         }
         
-        self.received(chunk: set, for: url)
+        let delegate = SessionDataDelegate(callback: callback)
         
-        self.previous[url] = data
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: OperationQueue())
         
-        self.semaphore.signal()
-    }
-
-    public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let request = task.currentRequest, let url = request.url else { return }
-        
-        self.completionBlocks[url]?()
-        self.cleanup(url)
+        let request = URLRequest(url: url)
+        let task = session.dataTask(with: request)
+        task.resume()
     }
     
-    func received(chunk values: Set<Value>, for url: URL) {
-        guard !values.isEmpty else { return }
-        
-        self.streamBlocks[url]?(values)
-    }
-    
-    private func cleanup(_ url: URL) {
-        self.previous[url] = Data()
-        
-        self.tasks.removeValue(forKey: url)
-        self.streamBlocks.removeValue(forKey: url)
-        self.completionBlocks.removeValue(forKey: url)
-    }
 }
